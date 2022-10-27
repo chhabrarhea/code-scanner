@@ -41,6 +41,7 @@ import android.view.SurfaceHolder;
 import androidx.annotation.MainThread;
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
+
 import com.google.zxing.BarcodeFormat;
 
 /**
@@ -123,6 +124,7 @@ public final class CodeScanner {
     private boolean mTouchFocusEnabled = DEFAULT_TOUCH_FOCUS_ENABLED;
     private boolean mTouchFocusing = false;
     private boolean mPreviewActive = false;
+    private boolean mPreviewRequested = false;
     private boolean mSafeAutoFocusing = false;
     private boolean mSafeAutoFocusTaskScheduled = false;
     private boolean mInitializationRequested = false;
@@ -167,7 +169,7 @@ public final class CodeScanner {
      */
     @MainThread
     public CodeScanner(@NonNull final Context context, @NonNull final CodeScannerView view,
-            final int cameraId) {
+                       final int cameraId) {
         this(context, view);
         mCameraId = cameraId;
     }
@@ -450,6 +452,7 @@ public final class CodeScanner {
      */
     @MainThread
     public void startPreview() {
+        mPreviewRequested = true;
         synchronized (mInitializeLock) {
             if (!mInitialized && !mInitialization) {
                 initialize();
@@ -566,6 +569,7 @@ public final class CodeScanner {
                 camera.startPreview();
                 mStoppingPreview = false;
                 mPreviewActive = true;
+                mPreviewRequested = false;
                 mSafeAutoFocusing = false;
                 mSafeAutoFocusAttemptsCount = 0;
                 if (decoderWrapper.isAutoFocusSupported() && mAutoFocusEnabled) {
@@ -726,7 +730,7 @@ public final class CodeScanner {
                     if (mInitialized) {
                         releaseResources();
                     }
-                    if (previewActive || mInitializationRequested) {
+                    if (previewActive || mInitializationRequested || mPreviewRequested) {
                         initialize(width, height);
                     }
                 }
@@ -768,7 +772,7 @@ public final class CodeScanner {
 
         @Override
         public void surfaceChanged(final SurfaceHolder holder, final int format, final int width,
-                final int height) {
+                                   final int height) {
             if (holder.getSurface() == null) {
                 mPreviewActive = false;
                 return;
@@ -816,86 +820,88 @@ public final class CodeScanner {
         }
 
         private void initialize() {
-            Camera camera = null;
-            final CameraInfo cameraInfo = new CameraInfo();
-            final int cameraId = mCameraId;
-            if (cameraId == CAMERA_BACK || cameraId == CAMERA_FRONT) {
-                final int numberOfCameras = Camera.getNumberOfCameras();
-                final int facing = cameraId == CAMERA_BACK ? CameraInfo.CAMERA_FACING_BACK :
-                        CameraInfo.CAMERA_FACING_FRONT;
-                for (int i = 0; i < numberOfCameras; i++) {
-                    Camera.getCameraInfo(i, cameraInfo);
-                    if (cameraInfo.facing == facing) {
-                        camera = Camera.open(i);
-                        mCameraId = i;
-                        break;
+            synchronized (mInitializeLock) {
+                Camera camera = null;
+                final CameraInfo cameraInfo = new CameraInfo();
+                final int cameraId = mCameraId;
+                if (cameraId == CAMERA_BACK || cameraId == CAMERA_FRONT) {
+                    final int numberOfCameras = Camera.getNumberOfCameras();
+                    final int facing = cameraId == CAMERA_BACK ? CameraInfo.CAMERA_FACING_BACK :
+                            CameraInfo.CAMERA_FACING_FRONT;
+                    for (int i = 0; i < numberOfCameras; i++) {
+                        Camera.getCameraInfo(i, cameraInfo);
+                        if (cameraInfo.facing == facing) {
+                            camera = Camera.open(i);
+                            mCameraId = i;
+                            break;
+                        }
+                    }
+                } else {
+                    camera = Camera.open(cameraId);
+                    Camera.getCameraInfo(cameraId, cameraInfo);
+                }
+                if (camera == null) {
+                    throw new CodeScannerException("Unable to access camera");
+                }
+                final Parameters parameters = camera.getParameters();
+                if (parameters == null) {
+                    throw new CodeScannerException("Unable to configure camera");
+                }
+                final int orientation = Utils.getDisplayOrientation(mContext, cameraInfo);
+                final boolean portrait = Utils.isPortrait(orientation);
+                final Point imageSize =
+                        Utils.findSuitableImageSize(parameters, portrait ? mHeight : mWidth,
+                                portrait ? mWidth : mHeight);
+                final int imageWidth = imageSize.getX();
+                final int imageHeight = imageSize.getY();
+                parameters.setPreviewSize(imageWidth, imageHeight);
+                parameters.setPreviewFormat(ImageFormat.NV21);
+                final Point previewSize = Utils.getPreviewSize(portrait ? imageHeight : imageWidth,
+                        portrait ? imageWidth : imageHeight, mWidth, mHeight);
+                final List<String> focusModes = parameters.getSupportedFocusModes();
+                final boolean autoFocusSupported = focusModes != null &&
+                        (focusModes.contains(Parameters.FOCUS_MODE_AUTO) ||
+                                focusModes.contains(Parameters.FOCUS_MODE_CONTINUOUS_PICTURE));
+                if (!autoFocusSupported) {
+                    mAutoFocusEnabled = false;
+                }
+                final Point viewSize = new Point(mWidth, mHeight);
+                if (autoFocusSupported && mAutoFocusEnabled) {
+                    Utils.setAutoFocusMode(parameters, mAutoFocusMode);
+                    final Rect frameRect = mScannerView.getFrameRect();
+                    if (frameRect != null) {
+                        Utils.configureDefaultFocusArea(parameters, frameRect, previewSize, viewSize,
+                                imageWidth, imageHeight, orientation);
                     }
                 }
-            } else {
-                camera = Camera.open(cameraId);
-                Camera.getCameraInfo(cameraId, cameraInfo);
-            }
-            if (camera == null) {
-                throw new CodeScannerException("Unable to access camera");
-            }
-            final Parameters parameters = camera.getParameters();
-            if (parameters == null) {
-                throw new CodeScannerException("Unable to configure camera");
-            }
-            final int orientation = Utils.getDisplayOrientation(mContext, cameraInfo);
-            final boolean portrait = Utils.isPortrait(orientation);
-            final Point imageSize =
-                    Utils.findSuitableImageSize(parameters, portrait ? mHeight : mWidth,
-                            portrait ? mWidth : mHeight);
-            final int imageWidth = imageSize.getX();
-            final int imageHeight = imageSize.getY();
-            parameters.setPreviewSize(imageWidth, imageHeight);
-            parameters.setPreviewFormat(ImageFormat.NV21);
-            final Point previewSize = Utils.getPreviewSize(portrait ? imageHeight : imageWidth,
-                    portrait ? imageWidth : imageHeight, mWidth, mHeight);
-            final List<String> focusModes = parameters.getSupportedFocusModes();
-            final boolean autoFocusSupported = focusModes != null &&
-                    (focusModes.contains(Parameters.FOCUS_MODE_AUTO) ||
-                            focusModes.contains(Parameters.FOCUS_MODE_CONTINUOUS_PICTURE));
-            if (!autoFocusSupported) {
-                mAutoFocusEnabled = false;
-            }
-            final Point viewSize = new Point(mWidth, mHeight);
-            if (autoFocusSupported && mAutoFocusEnabled) {
-                Utils.setAutoFocusMode(parameters, mAutoFocusMode);
-                final Rect frameRect = mScannerView.getFrameRect();
-                if (frameRect != null) {
-                    Utils.configureDefaultFocusArea(parameters, frameRect, previewSize, viewSize,
-                            imageWidth, imageHeight, orientation);
+                final List<String> flashModes = parameters.getSupportedFlashModes();
+                final boolean flashSupported =
+                        flashModes != null && flashModes.contains(Parameters.FLASH_MODE_TORCH);
+                if (!flashSupported) {
+                    mFlashEnabled = false;
                 }
+                final int zoom = mZoom;
+                if (zoom != 0) {
+                    Utils.setZoom(parameters, zoom);
+                }
+                Utils.configureFpsRange(parameters);
+                Utils.configureSceneMode(parameters);
+                Utils.configureVideoStabilization(parameters);
+                camera.setParameters(parameters);
+                camera.setDisplayOrientation(orientation);
+                synchronized (mInitializeLock) {
+                    final Decoder decoder =
+                            new Decoder(mDecoderStateListener, mExceptionHandler, mFormats,
+                                    mDecodeCallback);
+                    mDecoderWrapper =
+                            new DecoderWrapper(camera, cameraInfo, decoder, imageSize, previewSize,
+                                    viewSize, orientation, autoFocusSupported, flashSupported);
+                    decoder.start();
+                    mInitialization = false;
+                    mInitialized = true;
+                }
+                mMainThreadHandler.post(new FinishInitializationTask(previewSize));
             }
-            final List<String> flashModes = parameters.getSupportedFlashModes();
-            final boolean flashSupported =
-                    flashModes != null && flashModes.contains(Parameters.FLASH_MODE_TORCH);
-            if (!flashSupported) {
-                mFlashEnabled = false;
-            }
-            final int zoom = mZoom;
-            if (zoom != 0) {
-                Utils.setZoom(parameters, zoom);
-            }
-            Utils.configureFpsRange(parameters);
-            Utils.configureSceneMode(parameters);
-            Utils.configureVideoStabilization(parameters);
-            camera.setParameters(parameters);
-            camera.setDisplayOrientation(orientation);
-            synchronized (mInitializeLock) {
-                final Decoder decoder =
-                        new Decoder(mDecoderStateListener, mExceptionHandler, mFormats,
-                                mDecodeCallback);
-                mDecoderWrapper =
-                        new DecoderWrapper(camera, cameraInfo, decoder, imageSize, previewSize,
-                                viewSize, orientation, autoFocusSupported, flashSupported);
-                decoder.start();
-                mInitialization = false;
-                mInitialized = true;
-            }
-            mMainThreadHandler.post(new FinishInitializationTask(previewSize));
         }
     }
 
